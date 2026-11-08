@@ -228,13 +228,28 @@ def get_summary(context: str) -> dict:
     client = anthropic.Anthropic(api_key=secret("ANTHROPIC_API_KEY"))
     msg = client.messages.create(
         model=MODEL,
-        max_tokens=500,
+        max_tokens=1500,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": context}],
+        messages=[{"role": "user", "content": context +
+                   "\n\nRispondi solo con l'oggetto JSON, senza testo prima o dopo "
+                   "e senza blocchi di codice."}],
     )
     text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    return parse_summary(text)
+
+
+def parse_summary(text: str) -> dict:
+    """Legge il JSON della risposta; se non è valido mostra comunque il testo."""
     start, end = text.find("{"), text.rfind("}")
-    return json.loads(text[start:end + 1])
+    if start != -1 and end > start:
+        try:
+            data = json.loads(text[start:end + 1])
+            if isinstance(data, dict) and data.get("sintesi"):
+                return data
+        except json.JSONDecodeError:
+            pass
+    clean = text.replace("```json", "").replace("```", "").strip()
+    return {"sentiment": "neutro", "sintesi": clean[:700], "temi": []}
 
 
 def build_context(label, etf, perf, companies, comp_perf, news):
