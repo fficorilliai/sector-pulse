@@ -41,6 +41,11 @@ st.set_page_config(page_title="Sector Pulse", page_icon="📈", layout="centered
 # ----------------------------------------------------------------------------
 # Utilità
 # ----------------------------------------------------------------------------
+def esc(text, quote=True):
+    """Escape HTML e il simbolo $ (Streamlit lo leggerebbe come formula)."""
+    return html.escape(str(text), quote=quote).replace("$", "&#36;")
+
+
 def secret(name, default=""):
     try:
         return st.secrets.get(name, default)
@@ -160,6 +165,8 @@ def get_sector_info(key: str) -> dict:
                 companies.append({"symbol": str(sym), "name": str(r.get("name", sym))})
     except Exception:
         pass
+    if not industries and not companies:
+        raise RuntimeError("Yahoo non ha restituito industrie né aziende")
     return {"industries": industries, "companies": companies}
 
 
@@ -397,10 +404,12 @@ sent_colors = {"positivo": ("rgba(52,211,153,0.16)", "#6EE7B7"),
 
 def render_detail(key):
     label, etf = SECTORS[key]
+    sector_err = None
     try:
         info = get_sector_info(key)
-    except Exception:
+    except Exception as e:
         info = {"industries": [], "companies": []}
+        sector_err = f"{type(e).__name__}: {str(e)[:160]}"
     companies = info["companies"][:5]
     comp_perf = {}
     if companies:
@@ -427,29 +436,29 @@ def render_detail(key):
     if summary:
         s = str(summary.get("sentiment", "neutro")).lower()
         bg, fg = sent_colors.get(s, sent_colors["neutro"])
-        temi = "".join(f"<li>{html.escape(str(t))}</li>" for t in summary.get("temi", []))
+        temi = "".join(f"<li>{esc(str(t))}</li>" for t in summary.get("temi", []))
         body = (f'<p style="font-size:15px;line-height:1.6;margin:10px 0 8px">'
-                f'{html.escape(str(summary.get("sintesi", "")))}</p>'
+                f'{esc(str(summary.get("sintesi", "")))}</p>'
                 f'<ul style="margin:0 0 6px;padding-left:20px;font-size:14px;line-height:1.55;color:#C5CDD8">{temi}</ul>')
-        pill = f'<span class="a-pill" style="background:{bg};color:{fg}">Sentiment: {html.escape(s)}</span>'
+        pill = f'<span class="a-pill" style="background:{bg};color:{fg}">Sentiment: {esc(s)}</span>'
     else:
-        body = f'<p class="a-small" style="margin:10px 0">{html.escape(err or "")}</p>'
+        body = f'<p class="a-small" style="margin:10px 0">{esc(err or "")}</p>'
         pill = ""
 
     items = ""
     for n in news[:5]:
-        link = html.escape(n["link"] or "#", quote=True)
+        link = esc(n["link"] or "#", quote=True)
         items += (f'<div class="item"><a href="{link}" target="_blank" rel="noopener">'
-                  f'<div class="t">{html.escape(n["title"])}</div>'
-                  f'<div class="m"><span class="a-chip">{html.escape(n["ticker"])}</span>'
-                  f'{html.escape(n["publisher"])} · {time_ago(n["ts"])}</div></a></div>')
+                  f'<div class="t">{esc(n["title"])}</div>'
+                  f'<div class="m"><span class="a-chip">{esc(n["ticker"])}</span>'
+                  f'{esc(n["publisher"])} · {time_ago(n["ts"])}</div></a></div>')
 
     cos = ""
     for c in companies:
         cp = comp_perf.get(c["symbol"]) or {}
         d = cp.get("1g")
-        cos += (f'<div class="a-co"><span><b>{html.escape(c["symbol"])}</b> '
-                f'<span class="a-small">{html.escape(c["name"])}</span></span>'
+        cos += (f'<div class="a-co"><span><b>{esc(c["symbol"])}</b> '
+                f'<span class="a-small">{esc(c["name"])}</span></span>'
                 f'<b style="color:{pct_color(d)}">{fmt_pct(d)}</b></div>')
 
     st.markdown(
@@ -464,6 +473,9 @@ def render_detail(key):
         f'<div class="a-small" style="padding:6px 0 10px">Variazione di oggi</div></div>',
         unsafe_allow_html=True)
 
+    if sector_err:
+        st.caption("Aziende e sottosettori non disponibili: Yahoo non ha risposto "
+                   f"({sector_err}). Riprova più tardi con ↻.")
     if info["industries"]:
         with st.expander("Sottosettori"):
             rows = ""
@@ -471,7 +483,7 @@ def render_detail(key):
                 w = ind["weight"]
                 w_txt = (f"{w * 100:.1f}%".replace(".", ",")
                          if isinstance(w, (int, float)) and not pd.isna(w) else "")
-                rows += (f'<div class="a-co"><span>{html.escape(ind["name"])}</span>'
+                rows += (f'<div class="a-co"><span>{esc(ind["name"])}</span>'
                          f'<span class="a-small">{w_txt}</span></div>')
             st.markdown(rows + '<div class="a-small" style="padding-top:6px">Peso dell\'industria nel settore</div>',
                         unsafe_allow_html=True)
