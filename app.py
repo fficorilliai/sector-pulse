@@ -337,13 +337,20 @@ def get_summary(context: str) -> dict:
     import anthropic
 
     client = anthropic.Anthropic(api_key=secret("ANTHROPIC_API_KEY"))
+    # Haiku 5.5 "ragiona" prima di rispondere e quel ragionamento conta nel limite di token:
+    # un limite basso lascia la risposta vuota. Per questo il tetto è alto.
     msg = client.messages.create(
         model=MODEL,
-        max_tokens=3500,
+        max_tokens=16000,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": context}],
     )
     text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    reason = getattr(msg, "stop_reason", None)
+    if reason == "refusal":
+        raise RuntimeError("Claude ha rifiutato la richiesta (filtro di sicurezza)")
+    if not text.strip():
+        raise RuntimeError(f"risposta vuota (motivo: {reason})")
     return parse_summary(text)
 
 
@@ -563,7 +570,7 @@ def render_detail(key):
             with st.spinner(f"Claude sta leggendo {len(news)} notizie…"):
                 summary = get_summary(ctx)
         except Exception as e:
-            err = f"Non sono riuscito a generare la sintesi ({type(e).__name__})."
+            err = f"Non sono riuscito a generare la sintesi: {type(e).__name__}: {str(e)[:200]}"
 
     # riga informativa su quante notizie sono state lette
     publishers = len({n["publisher"] for n in news if n["publisher"]})
