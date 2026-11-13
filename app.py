@@ -5,6 +5,8 @@ Sintesi: API di Anthropic (modello Haiku, costo di pochi centesimi al mese).
 """
 import html
 import json
+import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -16,6 +18,11 @@ import yfinance as yf
 # Configurazione
 # ----------------------------------------------------------------------------
 MODEL = "claude-haiku-5-5"          # per risultati più ricchi: "claude-sonnet-5-5"
+NEWS_PER_TICKER = 20              # notizie richieste a Yahoo per ogni ticker
+MAX_ARTICLES = 80                 # massimo di notizie inviate a Claude
+NEWS_PER_QUERY = 30               # notizie per ogni ricerca di settore/industria
+TOP_INDUSTRIES = 3                # quante industrie del settore allargano la ricerca (0 = disattiva)
+EXTRA_PER_INDUSTRY = 4            # aziende in più per industria (0 = disattiva)
 CACHE_SECONDS = 600                 # prezzi e notizie restano in cache 10 minuti
 TZ = ZoneInfo("Europe/Rome")
 
@@ -46,6 +53,10 @@ def esc(text, quote=True):
     return html.escape(str(text), quote=quote).replace("$", "&#36;")
 
 
+def publisher_txt(n):
+    return f"{n} testat" + ("a" if n == 1 else "e")
+
+
 def secret(name, default=""):
     try:
         return st.secrets.get(name, default)
@@ -74,6 +85,12 @@ def tile_bg(p):
     strength = min(abs(p) * 100 / 2.0, 1.0) * 0.30 + 0.07
     rgb = "6,95,59" if p >= 0 else "194,65,12"
     return f"rgba({rgb},{strength:.2f})"
+
+
+def abs_time(ts):
+    if ts is None or pd.isna(ts):
+        return "n.d."
+    return ts.tz_convert(TZ).strftime("%d/%m %H:%M")
 
 
 def time_ago(ts):
@@ -176,6 +193,14 @@ def get_industry_top(key: str):
     return None if df is None else df.reset_index()
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_industry_symbols(key: str) -> list:
+    df = yf.Industry(key).top_companies
+    if df is None or not len(df):
+        raise RuntimeError("nessuna azienda")
+    return [str(x) for x in df.head(EXTRA_PER_INDUSTRY).index]
+
+
 # ----------------------------------------------------------------------------
 # Dati: notizie (Yahoo Finance)
 # ----------------------------------------------------------------------------
@@ -198,37 +223,113 @@ def parse_news(item: dict, source_ticker: str):
             "summary": c.get("summary") or c.get("description") or ""}
 
 
-@st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)
-def get_news(tickers: tuple, limit: int = 8):
-    seen, items = set(), []
-    for t in tickers:
+def fetch_raw_news(ticker: str):
+    tk = yf.Ticker(ticker)
+    for kwargs in ({"count": NEWS_PER_TICKER, "tab": "all"}, {"count": NEWS_PER_TICKER}):
         try:
-            raw = yf.Ticker(t).news or []
+            got = tk.get_news(**kwargs)
+            if got:
+                return got
         except Exception:
             continue
-        for it in raw[:6]:
-            n = parse_news(it, t)
-            if n and n["title"] not in seen:
-                seen.add(n["title"])
-                items.append(n)
-    items.sort(key=lambda n: n["ts"] if n["ts"] is not None and not pd.isna(n["ts"])
-               else pd.Timestamp(0, tz="UTC"), reverse=True)
-    return items[:limit]
+    try:
+        return tk.news or []
+    except Exception:
+        return []
+
+
+def fetch_search_news(query: str):
+    """Notizie di settore cercate per parola chiave, non legate a un singolo titolo."""
+    try:
+        return yf.Search(query, max_results=1, news_count=NEWS_PER_QUERY,
+                         include_cb=False, raise_errors=False).news or []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)
+def get_news(tickers: tuple, queries: tuple = ()):
+    """Raccoglie notizie di ETF, aziende e ricerche di settore; toglie i doppioni e tiene
+    le ultime 24 ore (se sono poche allarga a 48)."""
+    jobs = [("t", t) for t in tickers] + [("q", q) for q in queries]
+
+    def run(job):
+        kind, value = job
+        return fetch_raw_news(value) if kind == "t" else fetch_search_news(value)
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        results = list(ex.map(run, jobs))
+
+    by_key, fetched = {}, 0
+    for (kind, value), raws in zip(jobs, results):
+        label = value if kind == "t" else "settore"
+        for raw in raws:
+            n = parse_news(raw, label)
+            if not n:
+                continue
+            fetched += 1
+            related = [str(x) for x in (raw.get("relatedTickers") or [])][:3] if kind == "q" else []
+            tags = related or [label]
+            k = re.sub(r"\W+", " ", n["title"].lower()).strip()
+            if k in by_key:
+                cur = by_key[k]
+                cur["reach"] += 1
+                for tg in tags:
+                    if tg not in cur["tickers"]:
+                        cur["tickers"].append(tg)
+            else:
+                n["tickers"] = list(tags)
+                n["reach"] = 1
+                by_key[k] = n
+    items = sorted(by_key.values(),
+                   key=lambda n: n["ts"] if n["ts"] is not None and not pd.isna(n["ts"])
+                   else pd.Timestamp(0, tz="UTC"), reverse=True)
+    now = pd.Timestamp.now(tz="UTC")
+
+    def within(hours):
+        return [n for n in items if n["ts"] is not None and not pd.isna(n["ts"])
+                and now - n["ts"] <= pd.Timedelta(hours=hours)]
+
+    window, chosen = 24, within(24)
+    if len(chosen) < 8:
+        window, chosen = 48, within(48)
+    if len(chosen) < 4:
+        window, chosen = None, items
+    if len(chosen) > MAX_ARTICLES:   # se sono troppe, tieni le più riprese e recenti
+        keep = sorted(chosen, key=lambda n: (n["reach"], n["ts"] if n["ts"] is not None
+                                             and not pd.isna(n["ts"]) else pd.Timestamp(0, tz="UTC")),
+                      reverse=True)[:MAX_ARTICLES]
+        chosen = sorted(keep, key=lambda n: n["ts"] if n["ts"] is not None and not pd.isna(n["ts"])
+                        else pd.Timestamp(0, tz="UTC"), reverse=True)
+    return {"items": chosen, "window": window, "fetched": fetched, "unique": len(items),
+            "n_tickers": len(tickers), "n_queries": len(queries)}
 
 
 # ----------------------------------------------------------------------------
 # Sintesi con Claude (cache: stessa notizia = nessuna nuova chiamata)
 # ----------------------------------------------------------------------------
-SYSTEM_PROMPT = (
-    "Sei un assistente che riassume l'andamento di un settore azionario USA per un "
-    "investitore privato italiano. Usa SOLO i dati e i titoli forniti, non inventare "
-    "fatti, cifre o motivazioni che non compaiono nel materiale. Se i titoli non "
-    "spiegano il movimento, dillo. Non dare consigli di investimento. "
-    "Rispondi esclusivamente con un oggetto JSON con queste chiavi: "
-    '"sentiment" (uno tra "positivo", "neutro", "negativo", "misto"), '
-    '"sintesi" (3-4 frasi in italiano), '
-    '"temi" (lista di 2-3 brevi temi o rischi emersi, in italiano).'
-)
+SYSTEM_PROMPT = """Sei un analista che prepara un briefing sul settore azionario USA per un investitore privato italiano.
+Ricevi i dati di prezzo e un elenco numerato di notizie delle ultime ore (titolo e, se c'è, un breve riassunto).
+Usa SOLO il materiale fornito: non inventare fatti, cifre, cause o citazioni, e non usare conoscenze esterne sugli eventi di oggi. Se le notizie non spiegano un movimento di prezzo, dillo.
+Non dare consigli di investimento.
+
+Lavora così:
+1. Raggruppa le notizie che parlano della stessa vicenda in un unico tema.
+2. Assegna a ogni tema una priorità (alta, media, bassa) in base a questi criteri:
+   - TIPO DI EVENTO: risultati trimestrali e guidance, fusioni e acquisizioni, grandi accordi industriali, regolamentazione e cause legali, decisioni macro o di banche centrali, annunci di prodotto rilevanti pesano di più. Analisi di mercato e giudizi degli analisti pesano in modo medio. Articoli di opinione, liste "titoli da comprare", rendimenti ipotetici e contenuti promozionali pesano poco: ignorali o mettili a priorità bassa.
+   - AMPIEZZA: più testate indipendenti sullo stesso tema aumentano il peso.
+   - IMPATTO SUL PREZZO: se il titolo o l'ETF collegato si muove molto oggi, il peso aumenta.
+   - FRESCHEZZA: a parità di altri fattori contano di più le notizie più recenti.
+3. Scrivi prima un quadro generale che sintetizza TUTTE le notizie, poi vai nel dettaglio sui temi, dal più al meno importante.
+
+Rispondi esclusivamente con un oggetto JSON, senza testo prima o dopo e senza blocchi di codice, con queste chiavi:
+"sentiment": uno tra "positivo", "neutro", "negativo", "misto";
+"quadro_generale": macro-sintesi in italiano di 5-7 frasi su ciò che emerge nel complesso e su come si collega ai movimenti di prezzo;
+"temi": lista ordinata per priorità, massimo 6 elementi, ciascuno con:
+   "titolo" (breve), "priorita" ("alta"|"media"|"bassa"), "perche" (una frase sul motivo della priorità),
+   "dettaglio" (alta: 4-6 frasi con fatti e cifre presenti nelle notizie; media: 2-3 frasi; bassa: 1 frase),
+   "ticker" (lista dei ticker coinvolti), "articoli" (lista dei numeri delle notizie a supporto);
+"non_spiegato": una frase su ciò che le notizie non chiariscono (stringa vuota se tutto è chiaro)."""
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -238,11 +339,9 @@ def get_summary(context: str) -> dict:
     client = anthropic.Anthropic(api_key=secret("ANTHROPIC_API_KEY"))
     msg = client.messages.create(
         model=MODEL,
-        max_tokens=1500,
+        max_tokens=3500,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": context +
-                   "\n\nRispondi solo con l'oggetto JSON, senza testo prima o dopo "
-                   "e senza blocchi di codice."}],
+        messages=[{"role": "user", "content": context}],
     )
     text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
     return parse_summary(text)
@@ -254,26 +353,28 @@ def parse_summary(text: str) -> dict:
     if start != -1 and end > start:
         try:
             data = json.loads(text[start:end + 1])
-            if isinstance(data, dict) and data.get("sintesi"):
+            if isinstance(data, dict) and (data.get("quadro_generale") or data.get("sintesi")):
+                data.setdefault("quadro_generale", data.get("sintesi", ""))
+                temi = data.get("temi")
+                data["temi"] = [t for t in temi if isinstance(t, dict)] if isinstance(temi, list) else []
                 return data
         except json.JSONDecodeError:
             pass
     clean = text.replace("```json", "").replace("```", "").strip()
-    return {"sentiment": "neutro", "sintesi": clean[:700], "temi": []}
+    return {"sentiment": "neutro", "quadro_generale": clean[:1200], "temi": [], "non_spiegato": ""}
 
 
-def build_context(label, etf, perf, companies, comp_perf, news):
+def build_context(label, etf, perf, moves, news):
     lines = [f"Settore: {label} (ETF proxy {etf})",
-             "Performance ETF: " + ", ".join(
+             "Performance dell'ETF: " + ", ".join(
                  f"{PERIODS[k]} {fmt_pct(perf.get(k), False)}" for k in PERIODS)]
-    cl = [f"{c['symbol']} {fmt_pct((comp_perf.get(c['symbol']) or {}).get('1g'), False)}"
-          for c in companies[:5]]
-    if cl:
-        lines.append("Aziende principali (oggi): " + ", ".join(cl))
-    lines.append("Titoli recenti:")
-    for n in news:
-        extra = f" - {n['summary'][:200]}" if n["summary"] else ""
-        lines.append(f"- [{n['ticker']}] {n['title']}{extra}")
+    mv = [f"{sym} {fmt_pct(v, False)}" for sym, v in moves.items() if v is not None]
+    if mv:
+        lines.append("Variazione di oggi dei titoli collegati: " + ", ".join(mv))
+    lines.append(f"Notizie ({len(news)}), dalla più recente:")
+    for i, n in enumerate(news, 1):
+        extra = f" — {n['summary'][:180]}" if n["summary"] else ""
+        lines.append(f"[{i}] ({', '.join(n['tickers'][:4])}; {n['publisher']}; {abs_time(n['ts'])}) {n['title']}{extra}")
     return "\n".join(lines)
 
 
@@ -320,6 +421,15 @@ a { color:#7DB4FF; }
 .a-detail { background:#12161C; padding:16px 14px 6px; border-top:1px solid #262C36; }
 .a-detail h3 { margin:0; font-size:16px; font-weight:600; }
 .a-pill { display:inline-block; padding:4px 10px; border-radius:999px; font-size:12px; font-weight:600; }
+.a-meta { font-size:12px; color:#9AA4B2; margin:4px 0 10px; }
+.a-macro { font-size:15px; line-height:1.65; margin:0 0 6px; }
+.a-theme { padding:14px 0; border-top:1px solid #262C36; }
+.a-theme .tt { font-size:15px; font-weight:600; line-height:1.35; }
+.a-theme .why { font-size:12px; color:#9AA4B2; margin:4px 0 0; }
+.a-theme .det { font-size:14px; line-height:1.6; color:#D5DBE5; margin:8px 0 0; }
+.a-theme .src { font-size:12px; color:#9AA4B2; margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+.a-theme .src a { color:#7DB4FF; text-decoration:none; }
+.a-prio { display:inline-block; padding:2px 8px; border-radius:6px; font-size:11px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; margin-right:8px; }
 .a-news .item { padding:12px 0; border-top:1px solid #262C36; }
 .a-news a { text-decoration:none; color:#E8ECF2; }
 .a-news .t { font-size:14px; font-weight:600; line-height:1.4; }
@@ -402,6 +512,11 @@ sent_colors = {"positivo": ("rgba(52,211,153,0.16)", "#6EE7B7"),
                "misto": ("rgba(250,204,21,0.16)", "#FDE68A")}
 
 
+PRIO_STYLE = {"alta": ("rgba(250,204,21,0.18)", "#FDE68A"),
+              "media": ("#263349", "#A9C8FF"),
+              "bassa": ("#232A33", "#9AA4B2")}
+
+
 def render_detail(key):
     label, etf = SECTORS[key]
     sector_err = None
@@ -410,16 +525,33 @@ def render_detail(key):
     except Exception as e:
         info = {"industries": [], "companies": []}
         sector_err = f"{type(e).__name__}: {str(e)[:160]}"
-    companies = info["companies"][:5]
+    companies = info["companies"][:8]
+    extra = []
+    if EXTRA_PER_INDUSTRY > 0:
+        for ind in info["industries"][:TOP_INDUSTRIES]:
+            try:
+                extra += get_industry_symbols(ind["key"])
+            except Exception:
+                pass
+    base = [c["symbol"] for c in companies]
+    all_syms = tuple(dict.fromkeys(base + extra))
+    queries = tuple(dict.fromkeys(
+        [f"{label} stocks"] + [re.sub(r"\s*-\s*", " ", ind["name"]) + " stocks"
+                               for ind in info["industries"][:TOP_INDUSTRIES]]))
     comp_perf = {}
-    if companies:
+    if all_syms:
         try:
-            comp_perf, _ = get_prices(tuple(c["symbol"] for c in companies))
+            comp_perf, _ = get_prices(all_syms)
         except Exception:
             comp_perf = {}
-    news = get_news((etf,) + tuple(c["symbol"] for c in companies[:3]))
 
-    # Sintesi di Claude
+    data = get_news((etf,) + all_syms, queries)
+    news = data["items"]
+    moves = {etf: (perfs.get(etf) or {}).get("1g")}
+    for sym in all_syms:
+        moves[sym] = (comp_perf.get(sym) or {}).get("1g")
+
+    # Briefing di Claude
     summary, err = None, None
     if not secret("ANTHROPIC_API_KEY"):
         err = "Chiave API di Anthropic non configurata: la sintesi è disattivata."
@@ -427,36 +559,63 @@ def render_detail(key):
         err = "Nessuna notizia recente trovata su Yahoo Finance per questo settore."
     else:
         try:
-            ctx = build_context(label, etf, perfs.get(etf) or {}, companies, comp_perf, news)
-            with st.spinner("Claude sta leggendo le notizie…"):
+            ctx = build_context(label, etf, perfs.get(etf) or {}, moves, news)
+            with st.spinner(f"Claude sta leggendo {len(news)} notizie…"):
                 summary = get_summary(ctx)
         except Exception as e:
             err = f"Non sono riuscito a generare la sintesi ({type(e).__name__})."
 
-    if summary:
-        s = str(summary.get("sentiment", "neutro")).lower()
-        bg, fg = sent_colors.get(s, sent_colors["neutro"])
-        temi = "".join(f"<li>{esc(str(t))}</li>" for t in summary.get("temi", []))
-        body = (f'<p style="font-size:15px;line-height:1.6;margin:10px 0 8px">'
-                f'{esc(str(summary.get("sintesi", "")))}</p>'
-                f'<ul style="margin:0 0 6px;padding-left:20px;font-size:14px;line-height:1.55;color:#C5CDD8">{temi}</ul>')
-        pill = f'<span class="a-pill" style="background:{bg};color:{fg}">Sentiment: {esc(s)}</span>'
+    # riga informativa su quante notizie sono state lette
+    publishers = len({n["publisher"] for n in news if n["publisher"]})
+    if data["window"] == 24:
+        arco = "delle ultime 24 ore"
+    elif data["window"] == 48:
+        arco = "delle ultime 48 ore (nelle ultime 24 ore ce n'erano poche)"
     else:
-        body = f'<p class="a-small" style="margin:10px 0">{esc(err or "")}</p>'
-        pill = ""
+        arco = "più recenti disponibili"
+    meta = (f'<div class="a-meta">Letture: {len(news)} notizie {arco}, da {publisher_txt(publishers)}. '
+            f'Fonti: ETF {esc(etf)}, {max(len(all_syms), 0)} aziende e '
+            f'{data["n_queries"]} ricerche di settore su Yahoo Finance.</div>') if news else ""
 
-    items = ""
-    for n in news[:5]:
-        link = esc(n["link"] or "#", quote=True)
-        items += (f'<div class="item"><a href="{link}" target="_blank" rel="noopener">'
-                  f'<div class="t">{esc(n["title"])}</div>'
-                  f'<div class="m"><span class="a-chip">{esc(n["ticker"])}</span>'
-                  f'{esc(n["publisher"])} · {time_ago(n["ts"])}</div></a></div>')
+    if summary:
+        s_ = str(summary.get("sentiment", "neutro")).lower()
+        bg, fg = sent_colors.get(s_, sent_colors["neutro"])
+        pill = f'<span class="a-pill" style="background:{bg};color:{fg}">Sentiment: {esc(s_)}</span>'
+        body = f'<p class="a-macro">{esc(summary.get("quadro_generale", ""))}</p>'
+        temi_html = ""
+        for t in summary.get("temi", []):
+            prio = str(t.get("priorita", "media")).lower()
+            pbg, pfg = PRIO_STYLE.get(prio, PRIO_STYLE["media"])
+            det = str(t.get("dettaglio", "")).strip()
+            why = str(t.get("perche", "")).strip()
+            chips = "".join(f'<span class="a-chip">{esc(x)}</span>' for x in (t.get("ticker") or [])[:6])
+            links = ""
+            for num in (t.get("articoli") or [])[:5]:
+                try:
+                    a = news[int(num) - 1]
+                except (ValueError, IndexError, TypeError):
+                    continue
+                href = esc(a["link"] or "#", quote=True)
+                label_a = esc(a["publisher"] or "fonte")
+                links += f'<a href="{href}" target="_blank" rel="noopener">{label_a}</a>'
+            temi_html += (
+                f'<div class="a-theme"><div class="tt"><span class="a-prio" style="background:{pbg};color:{pfg}">'
+                f'{esc(prio)}</span>{esc(t.get("titolo", ""))}</div>'
+                + (f'<div class="why">{esc(why)}</div>' if why else "")
+                + (f'<div class="det">{esc(det)}</div>' if det else "")
+                + (f'<div class="src">{chips}{links}</div>' if (chips or links) else "")
+                + '</div>')
+        non_sp = str(summary.get("non_spiegato", "")).strip()
+        extra = (f'<div class="a-small" style="padding:10px 0 4px"><b>Non spiegato dalle notizie:</b> {esc(non_sp)}</div>'
+                 if non_sp else "")
+        body += temi_html + extra
+    else:
+        pill = ""
+        body = f'<p class="a-small" style="margin:10px 0">{esc(err or "")}</p>'
 
     cos = ""
-    for c in companies:
-        cp = comp_perf.get(c["symbol"]) or {}
-        d = cp.get("1g")
+    for c in companies[:5]:
+        d = (comp_perf.get(c["symbol"]) or {}).get("1g")
         cos += (f'<div class="a-co"><span><b>{esc(c["symbol"])}</b> '
                 f'<span class="a-small">{esc(c["name"])}</span></span>'
                 f'<b style="color:{pct_color(d)}">{fmt_pct(d)}</b></div>')
@@ -464,14 +623,24 @@ def render_detail(key):
     st.markdown(
         f'<div class="a-detail">'
         f'<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">'
-        f'<h3>Cosa si dice</h3>{pill}</div>{body}'
-        f'<div class="a-small" style="margin-bottom:6px">Generato da Claude dai titoli di Yahoo Finance. '
-        f'Non è consulenza finanziaria.</div>'
-        f'<div class="a-news" style="margin-top:8px">{items}</div>'
-        f'<h3 style="margin-top:16px">Aziende principali</h3>'
-        f'<div style="margin-top:6px">{cos}</div>'
-        f'<div class="a-small" style="padding:6px 0 10px">Variazione di oggi</div></div>',
+        f'<h3>Cosa si dice</h3>{pill}</div>{meta}{body}'
+        f'<div class="a-small" style="margin:8px 0 6px">Generato da Claude dai titoli e dai brevi riassunti di '
+        f'Yahoo Finance, non dagli articoli completi. Non è consulenza finanziaria.</div>'
+        + (f'<h3 style="margin-top:16px">Aziende principali</h3><div style="margin-top:6px">{cos}</div>'
+           f'<div class="a-small" style="padding:6px 0 10px">Variazione di oggi</div>' if cos else "")
+        + '</div>',
         unsafe_allow_html=True)
+
+    if news:
+        with st.expander(f"Tutte le notizie analizzate ({len(news)})"):
+            items = ""
+            for n in news:
+                link = esc(n["link"] or "#", quote=True)
+                chips = "".join(f'<span class="a-chip">{esc(x)}</span>' for x in n["tickers"][:3])
+                items += (f'<div class="item"><a href="{link}" target="_blank" rel="noopener">'
+                          f'<div class="t">{esc(n["title"])}</div>'
+                          f'<div class="m">{chips}{esc(n["publisher"])} · {time_ago(n["ts"])}</div></a></div>')
+            st.markdown(f'<div class="a-news">{items}</div>', unsafe_allow_html=True)
 
     if sector_err:
         st.caption("Aziende e sottosettori non disponibili: Yahoo non ha risposto "
